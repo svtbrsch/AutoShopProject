@@ -1,0 +1,1623 @@
+import datetime
+import os
+import sqlite3
+import tkinter as tk
+from tkinter import messagebox, simpledialog, ttk
+
+DB_NAME = "autoshop.db"
+
+
+class AutoShopDB:
+    """Слой работы с базой данных (SQLite)"""
+
+    def __init__(self, db_name=DB_NAME):
+        self.conn = sqlite3.connect(db_name)
+        self.create_tables()
+
+    def create_tables(self):
+        with self.conn:
+            # Справочник категорий
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL
+                )
+            """
+            )
+            # Склад товаров (допускает отрицательные значения)
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS inventory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sku TEXT UNIQUE,
+                    name TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    current_qty INTEGER NOT NULL DEFAULT 0
+                )
+            """
+            )
+            # Журнал смен
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shifts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT,
+                    is_active INTEGER DEFAULT 1
+                )
+            """
+            )
+            # Детализация смены
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS shift_details (
+                    shift_id INTEGER,
+                    product_id INTEGER,
+                    initial_qty INTEGER DEFAULT 0,
+                    supplied_qty INTEGER DEFAULT 0,
+                    sold_qty INTEGER DEFAULT 0,
+                    defect_qty INTEGER DEFAULT 0,
+                    final_qty INTEGER DEFAULT 0,
+                    PRIMARY KEY(shift_id, product_id)
+                )
+            """
+            )
+            # Журнал продаж (нал / безнал)
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sales_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shift_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    qty INTEGER NOT NULL,
+                    price_per_item REAL NOT NULL,
+                    payment_type TEXT NOT NULL,
+                    timestamp TEXT NOT NULL
+                )
+            """
+            )
+            # Касса наличных
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cash_box (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    balance REAL DEFAULT 0.0
+                )
+            """
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO cash_box (id, balance) VALUES (1, 0.0)"
+            )
+            self.seed_defaults()
+
+    def seed_defaults(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM categories")
+        if cursor.fetchone()[0] == 0:
+            default_categories = [
+                ("Фильтры",),
+                ("Свечи",),
+                ("Тормозная система",),
+                ("Масла и жидкости",),
+            ]
+            cursor.executemany(
+                "INSERT INTO categories (name) VALUES (?)", default_categories
+            )
+
+        cursor.execute("SELECT COUNT(*) FROM inventory")
+        if cursor.fetchone()[0] == 0:
+            demo_items = [
+                ("AP-1001", "Масляный фильтр W712/94", "Фильтры", 650.0, 5),
+                ("AP-1002", "Свеча NGK BKR6E-11", "Свечи", 350.0, 10),
+                (
+                    "AP-1003",
+                    "Колодки тормозные Brembo P85020",
+                    "Тормозная система",
+                    2800.0,
+                    2,
+                ),
+                (
+                    "AP-1004",
+                    "Моторное масло 5W-40 4L",
+                    "Масла и жидкости",
+                    3400.0,
+                    4,
+                ),
+            ]
+            cursor.executemany(
+                "INSERT INTO inventory (sku, name, category, price, current_qty) VALUES (?, ?, ?, ?, ?)",
+                demo_items,
+            )
+        self.conn.commit()
+
+    # --- Категории ---
+    def get_categories(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT name FROM categories ORDER BY name")
+        return [row[0] for row in cursor.fetchall()]
+
+    def add_category(self, name):
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT INTO categories (name) VALUES (?)", (name,)
+                )
+            return True, "Категория добавлена"
+        except sqlite3.IntegrityError:
+            return False, "Категория уже существует"
+
+    def delete_category(self, name):
+        with self.conn:
+            self.conn.execute("DELETE FROM categories WHERE name = ?", (name,))
+
+    # --- Артикул ---
+    def generate_next_sku(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT MAX(id) FROM inventory")
+        max_id = cursor.fetchone()[0] or 0
+        return f"AP-{1000 + max_id + 1}"
+
+    # --- Смены ---
+    def get_active_shift(self):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT id, start_time FROM shifts WHERE is_active = 1 ORDER BY id DESC LIMIT 1"
+        )
+        return cursor.fetchone()
+
+    def open_shift(self):
+        with self.conn:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO shifts (start_time, is_active) VALUES (?, 1)",
+                (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+            )
+            shift_id = cursor.lastrowid
+
+            cursor.execute("SELECT id, current_qty FROM inventory")
+            items = cursor.fetchall()
+            for prod_id, qty in items:
+                cursor.execute(
+                    """
+                    INSERT INTO shift_details 
+                    (shift_id, product_id, initial_qty, supplied_qty, sold_qty, defect_qty, final_qty) 
+                    VALUES (?, ?, ?, 0, 0, 0, ?)
+                """,
+                    (shift_id, prod_id, qty, qty),
+                )
+        return shift_id
+
+    def close_shift(self, shift_id):
+        with self.conn:
+            self.conn.execute(
+                "UPDATE shifts SET is_active = 0, end_time = ? WHERE id = ?",
+                (
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    shift_id,
+                ),
+            )
+
+    # --- Касса наличных ---
+    def get_cash_balance(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT balance FROM cash_box WHERE id = 1")
+        row = cursor.fetchone()
+        return row[0] if row else 0.0
+
+    def adjust_cash(self, amount):
+        with self.conn:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT balance FROM cash_box WHERE id = 1")
+            cur_bal = cursor.fetchone()[0]
+            new_bal = cur_bal + amount
+            if new_bal < 0:
+                return False, "Недостаточно средств в кассе!"
+            cursor.execute(
+                "UPDATE cash_box SET balance = ? WHERE id = 1", (new_bal,)
+            )
+            return True, "Баланс кассы обновлён"
+
+    # --- Товары и остатки ---
+    def add_product(self, name, category, price, qty, shift_id=None):
+        sku = self.generate_next_sku()
+        with self.conn:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO inventory (sku, name, category, price, current_qty) 
+                VALUES (?, ?, ?, ?, ?)
+            """,
+                (sku, name, category, price, qty),
+            )
+            prod_id = cursor.lastrowid
+
+            if shift_id:
+                cursor.execute(
+                    """
+                    INSERT INTO shift_details 
+                    (shift_id, product_id, initial_qty, supplied_qty, sold_qty, defect_qty, final_qty) 
+                    VALUES (?, ?, 0, ?, 0, 0, ?)
+                """,
+                    (shift_id, prod_id, qty, qty),
+                )
+        return sku
+
+    def update_product_field(self, product_id, field, value):
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE inventory SET {field} = ? WHERE id = ?",
+                (value, product_id),
+            )
+
+    def adjust_product_qty(self, product_id, delta_qty, shift_id=None, is_supply=False):
+        """Прямая корректировка остатка товара (прибавить / убавить)"""
+        with self.conn:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE inventory SET current_qty = current_qty + ? WHERE id = ?",
+                (delta_qty, product_id),
+            )
+            if shift_id:
+                self.ensure_shift_detail(shift_id, product_id)
+                if is_supply and delta_qty > 0:
+                    cursor.execute(
+                        """
+                        UPDATE shift_details 
+                        SET supplied_qty = supplied_qty + ?, final_qty = final_qty + ? 
+                        WHERE shift_id = ? AND product_id = ?
+                    """,
+                        (delta_qty, delta_qty, shift_id, product_id),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE shift_details 
+                        SET final_qty = final_qty + ? 
+                        WHERE shift_id = ? AND product_id = ?
+                    """,
+                        (delta_qty, shift_id, product_id),
+                    )
+
+    def delete_products(self, product_ids):
+        with self.conn:
+            placeholders = ",".join("?" for _ in product_ids)
+            cursor = self.conn.cursor()
+            cursor.execute(
+                f"DELETE FROM inventory WHERE id IN ({placeholders})",
+                product_ids,
+            )
+            cursor.execute(
+                f"DELETE FROM shift_details WHERE product_id IN ({placeholders})",
+                product_ids,
+            )
+
+    def get_inventory(self, search_text="", category="Все"):
+        cursor = self.conn.cursor()
+        query = (
+            "SELECT id, sku, name, category, price, current_qty FROM inventory WHERE 1=1"
+        )
+        params = []
+
+        if search_text:
+            query += " AND (LOWER(name) LIKE ? OR LOWER(sku) LIKE ?)"
+            params.extend(
+                [f"%{search_text.lower()}%", f"%{search_text.lower()}%"]
+            )
+
+        if category and category != "Все":
+            query += " AND category = ?"
+            params.append(category)
+
+        query += " ORDER BY id DESC"
+        cursor.execute(query, params)
+        return cursor.fetchall()
+
+    def ensure_shift_detail(self, shift_id, product_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM shift_details WHERE shift_id = ? AND product_id = ?",
+            (shift_id, product_id),
+        )
+        if not cursor.fetchone():
+            cursor.execute(
+                "SELECT current_qty FROM inventory WHERE id = ?", (product_id,)
+            )
+            r = cursor.fetchone()
+            curr = r[0] if r else 0
+            cursor.execute(
+                """
+                INSERT INTO shift_details 
+                (shift_id, product_id, initial_qty, supplied_qty, sold_qty, defect_qty, final_qty)
+                VALUES (?, ?, ?, 0, 0, 0, ?)
+            """,
+                (shift_id, product_id, curr, curr),
+            )
+
+    # --- Продажи ---
+    def sell_item(self, shift_id, product_id, qty, payment_type="cash"):
+        with self.conn:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT price FROM inventory WHERE id = ?", (product_id,)
+            )
+            res = cursor.fetchone()
+            if not res:
+                return False, "Товар не найден в базе!"
+
+            price = res[0]
+            total_sum = price * qty
+
+            cursor.execute(
+                "UPDATE inventory SET current_qty = current_qty - ? WHERE id = ?",
+                (qty, product_id),
+            )
+
+            self.ensure_shift_detail(shift_id, product_id)
+            cursor.execute(
+                """
+                UPDATE shift_details 
+                SET sold_qty = sold_qty + ?, final_qty = final_qty - ? 
+                WHERE shift_id = ? AND product_id = ?
+            """,
+                (qty, qty, shift_id, product_id),
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO sales_log (shift_id, product_id, qty, price_per_item, payment_type, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    shift_id,
+                    product_id,
+                    qty,
+                    price,
+                    payment_type,
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+
+            if payment_type == "cash":
+                cursor.execute(
+                    "UPDATE cash_box SET balance = balance + ? WHERE id = 1",
+                    (total_sum,),
+                )
+
+            return True, "Успешно списано"
+
+    # --- Итоги смены ---
+    def get_shift_summary(self, shift_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT 
+                i.sku,
+                i.name,
+                sd.initial_qty,
+                sd.supplied_qty,
+                (sd.initial_qty + sd.supplied_qty) as total_initial,
+                sd.sold_qty,
+                sd.defect_qty,
+                sd.final_qty,
+                COALESCE((SELECT SUM(qty * price_per_item) FROM sales_log WHERE shift_id = sd.shift_id AND product_id = sd.product_id), 0.0) as revenue,
+                i.price
+            FROM shift_details sd
+            JOIN inventory i ON sd.product_id = i.id
+            WHERE sd.shift_id = ?
+        """,
+            (shift_id,),
+        )
+        return cursor.fetchall()
+
+    def get_shift_payment_totals(self, shift_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT payment_type, SUM(qty * price_per_item) 
+            FROM sales_log 
+            WHERE shift_id = ? 
+            GROUP BY payment_type
+        """,
+            (shift_id,),
+        )
+        totals = {"cash": 0.0, "card": 0.0}
+        for p_type, amount in cursor.fetchall():
+            totals[p_type] = amount or 0.0
+        return totals
+
+
+class AutoShopApp:
+    """Главный пользовательский интерфейс"""
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("АРМ Автомагазина — Учет остатков и расхода за смену")
+        self.root.geometry("1060x650")
+
+        self.db = AutoShopDB()
+        self.current_shift = self.db.get_active_shift()
+
+        self.setup_menu()
+        self.setup_ui()
+        self.setup_context_menu()
+        self.refresh_table()
+
+    def setup_menu(self):
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        # Смена
+        shift_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Смена", menu=shift_menu)
+        shift_menu.add_command(
+            label="Открыть смену", command=self.open_shift_action
+        )
+        shift_menu.add_command(
+            label="Закрыть смену и получить отчет",
+            command=self.close_shift_action,
+        )
+
+        # Касса
+        cash_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Касса / Наличные", menu=cash_menu)
+        cash_menu.add_command(
+            label="Управление кассой", command=self.open_cash_box_window
+        )
+
+        # Справочники
+        ref_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Справочники", menu=ref_menu)
+        ref_menu.add_command(
+            label="Категории товаров", command=self.open_category_manager
+        )
+
+    def setup_ui(self):
+        # Верхний статус
+        top_bar = ttk.Frame(self.root, padding=8)
+        top_bar.pack(fill=tk.X)
+
+        self.shift_label = ttk.Label(
+            top_bar, text="", font=("Arial", 10, "bold")
+        )
+        self.shift_label.pack(side=tk.LEFT, padx=5)
+
+        self.cash_badge = ttk.Label(
+            top_bar, text="", font=("Arial", 10, "bold"), foreground="navy"
+        )
+        self.cash_badge.pack(side=tk.RIGHT, padx=10)
+
+        # Панель фильтров и поиска
+        filter_bar = ttk.LabelFrame(self.root, text="Фильтр и поиск", padding=8)
+        filter_bar.pack(fill=tk.X, padx=10, pady=3)
+
+        ttk.Label(filter_bar, text="Поиск:").pack(side=tk.LEFT, padx=3)
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(
+            filter_bar, textvariable=self.search_var, width=25
+        )
+        self.search_entry.pack(side=tk.LEFT, padx=5)
+        self.search_entry.bind("<KeyRelease>", lambda e: self.refresh_table())
+
+        ttk.Label(filter_bar, text="Категория:").pack(side=tk.LEFT, padx=5)
+        self.cat_filter_var = tk.StringVar(value="Все")
+        self.cat_filter_combo = ttk.Combobox(
+            filter_bar,
+            textvariable=self.cat_filter_var,
+            state="readonly",
+            width=20,
+        )
+        self.cat_filter_combo.pack(side=tk.LEFT, padx=5)
+        self.cat_filter_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self.refresh_table()
+        )
+
+        ttk.Button(
+            filter_bar, text="Сбросить", command=self.reset_filters
+        ).pack(side=tk.LEFT, padx=10)
+
+        # Раздельные кнопки Поставки и Нового товара
+        ttk.Button(
+            filter_bar,
+            text="➕ Новый товар",
+            command=self.open_add_product_window,
+        ).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(
+            filter_bar,
+            text="📦 Поставка товара",
+            command=self.open_supply_window,
+        ).pack(side=tk.RIGHT, padx=4)
+
+        self.update_category_filter_list()
+
+        # Таблица остатков
+        table_frame = ttk.LabelFrame(
+            self.root,
+            text="Текущие остатки на складе (допускается отрицательный остаток)",
+            padding=6,
+        )
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        cols = ("id", "sku", "name", "category", "price", "qty")
+        self.tree = ttk.Treeview(
+            table_frame, columns=cols, show="headings", selectmode="extended"
+        )
+        self.tree.heading("id", text="ID")
+        self.tree.heading("sku", text="Артикул")
+        self.tree.heading("name", text="Наименование")
+        self.tree.heading("category", text="Категория")
+        self.tree.heading("price", text="Цена (руб.)")
+        self.tree.heading("qty", text="Остаток (шт.)")
+
+        self.tree.column("id", width=45, anchor=tk.CENTER)
+        self.tree.column("sku", width=110, anchor=tk.CENTER)
+        self.tree.column("name", width=380)
+        self.tree.column("category", width=160)
+        self.tree.column("price", width=110, anchor=tk.E)
+        self.tree.column("qty", width=110, anchor=tk.CENTER)
+
+        scroll = ttk.Scrollbar(
+            table_frame, orient=tk.VERTICAL, command=self.tree.yview
+        )
+        self.tree.configure(yscroll=scroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Нижняя панель действий (без кнопки брака)
+        bottom_frame = ttk.Frame(self.root, padding=8)
+        bottom_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Button(
+            bottom_frame,
+            text="💵 Одиночная продажа",
+            command=self.handle_sale,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            bottom_frame,
+            text="🛒 Массовая продажа (Корзина)",
+            command=self.open_bulk_sale_window,
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            bottom_frame,
+            text="🗑️ Удалить выбранные",
+            command=self.handle_delete_products,
+        ).pack(side=tk.RIGHT, padx=4)
+
+    def setup_context_menu(self):
+        """Контекстное меню по клику правой кнопкой мыши"""
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(
+            label="Изменить остаток (+ / -)...", command=self.quick_adjust_qty
+        )
+        self.context_menu.add_separator()
+        self.context_menu.add_command(
+            label="Изменить наименование",
+            command=lambda: self.edit_product_field("name", "Наименование"),
+        )
+        self.context_menu.add_command(
+            label="Изменить цену",
+            command=lambda: self.edit_product_field("price", "Цену"),
+        )
+        self.tree.bind("<Button-3>", self.show_context_menu)
+        self.tree.bind("<Button-2>", self.show_context_menu)
+
+    def show_context_menu(self, event):
+        row_id = self.tree.identify_row(event.y)
+        if row_id:
+            if row_id not in self.tree.selection():
+                self.tree.selection_set(row_id)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def quick_adjust_qty(self):
+        """Быстрое добавление или списание количества у существующего товара"""
+        selected = self.tree.selection()
+        if not selected:
+            return
+        item = self.tree.item(selected[0])["values"]
+        prod_id, prod_name, cur_qty = item[0], item[2], item[5]
+
+        delta = simpledialog.askinteger(
+            "Изменение остатка",
+            f"Товар: {prod_name}\nТекущий остаток: {cur_qty} шт.\n\n"
+            f"Введите число для изменения:\n(например, 5 чтобы прибавить, или -2 чтобы списать):",
+            parent=self.root,
+        )
+        if delta is not None and delta != 0:
+            shift_id = self.current_shift[0] if self.current_shift else None
+            self.db.adjust_product_qty(
+                prod_id, delta, shift_id=shift_id, is_supply=(delta > 0)
+            )
+            self.refresh_table()
+            messagebox.showinfo(
+                "Успешно",
+                f"Остаток по товару «{prod_name}» изменён на {delta:+d} шт. "
+                f"(Новый остаток: {cur_qty + delta} шт.)",
+            )
+
+    def edit_product_field(self, field, title):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        item = self.tree.item(selected[0])["values"]
+        prod_id = item[0]
+
+        if field == "price":
+            val = simpledialog.askfloat(
+                "Изменение",
+                f"Введите новую {title}:",
+                initialvalue=float(item[4]),
+                parent=self.root,
+            )
+        else:
+            val = simpledialog.askstring(
+                "Изменение",
+                f"Введите новое {title}:",
+                initialvalue=item[2],
+                parent=self.root,
+            )
+
+        if val is not None and str(val).strip():
+            self.db.update_product_field(prod_id, field, val)
+            self.refresh_table()
+
+    def update_shift_ui(self):
+        cash_balance = self.db.get_cash_balance()
+        self.cash_badge.config(
+            text=f"Наличных в кассе: {cash_balance:,.2f} руб."
+        )
+        if self.current_shift:
+            self.shift_label.config(
+                text=f"🟢 Смена активна (ID: #{self.current_shift[0]} с {self.current_shift[1]})",
+                foreground="green",
+            )
+        else:
+            self.shift_label.config(
+                text="🔴 Смена закрыта (Операции расхода недоступны. Откройте смену через меню)",
+                foreground="red",
+            )
+
+    def update_category_filter_list(self):
+        cats = ["Все"] + self.db.get_categories()
+        self.cat_filter_combo["values"] = cats
+        if self.cat_filter_var.get() not in cats:
+            self.cat_filter_var.set("Все")
+
+    def reset_filters(self):
+        self.search_var.set("")
+        self.cat_filter_var.set("Все")
+        self.refresh_table()
+
+    def refresh_table(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        items = self.db.get_inventory(
+            self.search_var.get(), self.cat_filter_var.get()
+        )
+        for item in items:
+            self.tree.insert(
+                "",
+                tk.END,
+                values=(
+                    item[0],
+                    item[1],
+                    item[2],
+                    item[3],
+                    f"{item[4]:.2f}",
+                    item[5],
+                ),
+            )
+        self.update_shift_ui()
+
+    def open_shift_action(self):
+        if self.current_shift:
+            messagebox.showinfo(
+                "Информация", f"Смена #{self.current_shift[0]} уже открыта!"
+            )
+            return
+        shift_id = self.db.open_shift()
+        self.current_shift = self.db.get_active_shift()
+        self.update_shift_ui()
+        messagebox.showinfo(
+            "Успех", f"Смена #{shift_id} открыта! Остатки зафиксированы."
+        )
+
+    def close_shift_action(self):
+        if not self.current_shift:
+            messagebox.showwarning("Внимание", "Сейчас нет активной смены!")
+            return
+
+        confirm = messagebox.askyesno(
+            "Подтверждение закрытия смены",
+            f"Вы точно хотите закрыть смену #{self.current_shift[0]}?\n"
+            "После закрытия будет сформирован отчет и сохранен файл .txt.",
+            icon="warning",
+        )
+        if not confirm:
+            return
+
+        shift_id = self.current_shift[0]
+        summary = self.db.get_shift_summary(shift_id)
+        payment_totals = self.db.get_shift_payment_totals(shift_id)
+
+        self.db.close_shift(shift_id)
+        self.current_shift = None
+        self.update_shift_ui()
+
+        saved_file = self.export_shift_to_txt(shift_id, summary, payment_totals)
+        self.show_summary_window(shift_id, summary, payment_totals)
+
+        if saved_file:
+            messagebox.showinfo(
+                "Отчет сохранен",
+                f"Смена #{shift_id} закрыта.\nФайл блокнота создан:\n{saved_file}",
+            )
+
+    def export_shift_to_txt(self, shift_id, summary_data, payment_totals):
+        now = datetime.datetime.now()
+        date_str = now.strftime("%Y-%m-%d_%H-%M-%S")
+        display_date = now.strftime("%d.%m.%Y %H:%M:%S")
+
+        filename = f"Отчет_смена_{shift_id}_{date_str}.txt"
+
+        lines = [
+            "=" * 70,
+            f"          ОТЧЕТ ПО СМЕНЕ №{shift_id}",
+            f"          Дата и время закрытия: {display_date}",
+            "=" * 70,
+            "",
+            f"{'Товар':<32} | {'Кол-во':<8} | {'Цена/шт':<10} | {'Сумма':<10}",
+            "-" * 70,
+        ]
+
+        total_revenue = 0.0
+        total_qty = 0
+
+        for row in summary_data:
+            sold_qty = row[5]
+            if sold_qty > 0:
+                name = str(row[1])[:30]
+                price = row[9]
+                cost = row[8]
+
+                total_qty += sold_qty
+                total_revenue += cost
+
+                lines.append(
+                    f"{name:<32} | {sold_qty:<8} | {price:>9.2f}  | {cost:>9.2f}"
+                )
+
+        lines.append("-" * 70)
+        lines.append(f"ИТОГО ПРОДАНО: {total_qty} шт.")
+        lines.append(f"ОБЩАЯ ВЫРУЧКА: {total_revenue:,.2f} руб.")
+
+        if payment_totals:
+            cash = payment_totals.get("cash", 0.0)
+            card = payment_totals.get("card", 0.0)
+            lines.append(f"  - Наличными: {cash:,.2f} руб.")
+            lines.append(f"  - Безналичными (карта): {card:,.2f} руб.")
+
+        lines.append("=" * 70)
+
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            return filename
+        except Exception as e:
+            print(f"Ошибка сохранения файла: {e}")
+            return None
+
+    def open_cash_box_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("Касса предприятия (Наличные)")
+        win.geometry("380x250")
+        win.grab_set()
+
+        bal_label = ttk.Label(win, font=("Arial", 14, "bold"), padding=15)
+        bal_label.pack()
+
+        def update_bal_display():
+            b = self.db.get_cash_balance()
+            bal_label.config(text=f"В кассе: {b:,.2f} руб.")
+            self.update_shift_ui()
+
+        update_bal_display()
+
+        btn_frame = ttk.Frame(win, padding=10)
+        btn_frame.pack(fill=tk.BOTH, expand=True)
+
+        def add_cash_action():
+            val = simpledialog.askfloat(
+                "Внесение наличных",
+                "Введите сумму для внесения (руб.):",
+                parent=win,
+                minvalue=0.01,
+            )
+            if val:
+                self.db.adjust_cash(val)
+                update_bal_display()
+                messagebox.showinfo(
+                    "Успешно", f"Внесено: {val:,.2f} руб.", parent=win
+                )
+
+        def withdraw_cash_action():
+            val = simpledialog.askfloat(
+                "Изъятие наличных",
+                "Введите сумму для изъятия / инкассации (руб.):",
+                parent=win,
+                minvalue=0.01,
+            )
+            if val:
+                ok, res = self.db.adjust_cash(-val)
+                if ok:
+                    update_bal_display()
+                    messagebox.showinfo(
+                        "Успешно", f"Изъято: {val:,.2f} руб.", parent=win
+                    )
+                else:
+                    messagebox.showerror("Ошибка", res, parent=win)
+
+        ttk.Button(
+            btn_frame,
+            text="📥 Внести наличные (размен)",
+            command=add_cash_action,
+        ).pack(fill=tk.X, pady=5)
+        ttk.Button(
+            btn_frame,
+            text="📤 Изъять наличные (инкассация)",
+            command=withdraw_cash_action,
+        ).pack(fill=tk.X, pady=5)
+        ttk.Button(btn_frame, text="Закрыть", command=win.destroy).pack(
+            fill=tk.X, pady=10
+        )
+
+    # --- Одиночная продажа ---
+    def handle_sale(self):
+        if not self.current_shift:
+            messagebox.showwarning(
+                "Внимание",
+                "Нельзя списать товар при закрытой смене! Сначала откройте смену.",
+            )
+            return
+
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning("Внимание", "Выберите товар для продажи!")
+            return
+
+        item = self.tree.item(selected[0])["values"]
+        prod_id, prod_name, current_qty, price = (
+            item[0],
+            item[2],
+            item[5],
+            float(item[4]),
+        )
+
+        sale_win = tk.Toplevel(self.root)
+        sale_win.title("Оформление продажи")
+        sale_win.geometry("380x290")
+        sale_win.grab_set()
+
+        ttk.Label(
+            sale_win,
+            text=f"Товар: {prod_name}",
+            font=("Arial", 10, "bold"),
+            wraplength=350,
+        ).pack(pady=8)
+        ttk.Label(
+            sale_win,
+            text=f"Текущий остаток: {current_qty} шт. | Цена: {price:.2f} руб.",
+        ).pack()
+
+        form = ttk.Frame(sale_win, padding=10)
+        form.pack()
+
+        ttk.Label(form, text="Количество:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        qty_spin = ttk.Spinbox(form, from_=1, to=99999, width=10)
+        qty_spin.set(1)
+        qty_spin.grid(row=0, column=1, pady=5)
+
+        ttk.Label(form, text="Способ оплаты:").grid(
+            row=1, column=0, sticky=tk.W, pady=5
+        )
+        pay_type_var = tk.StringVar(value="cash")
+        pay_combo = ttk.Combobox(
+            form,
+            textvariable=pay_type_var,
+            values=["cash", "card"],
+            state="readonly",
+            width=10,
+        )
+        pay_combo.grid(row=1, column=1, pady=5)
+
+        total_lbl = ttk.Label(
+            sale_win,
+            text=f"Итого к оплате: {price:,.2f} руб.",
+            font=("Arial", 11, "bold"),
+        )
+        total_lbl.pack(pady=5)
+
+        def update_total(*args):
+            try:
+                q = int(qty_spin.get())
+                total_lbl.config(text=f"Итого к оплате: {q * price:,.2f} руб.")
+            except ValueError:
+                pass
+
+        qty_spin.bind("<KeyRelease>", update_total)
+        qty_spin.bind("<<Increment>>", update_total)
+        qty_spin.bind("<<Decrement>>", update_total)
+
+        def confirm_sale():
+            try:
+                qty = int(qty_spin.get())
+                if qty <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "Ошибка", "Введите корректное число штук!", parent=sale_win
+                )
+                return
+
+            pay_type = pay_type_var.get()
+            ok, msg = self.db.sell_item(
+                self.current_shift[0], prod_id, qty, payment_type=pay_type
+            )
+            if ok:
+                sale_win.destroy()
+                self.refresh_table()
+            else:
+                messagebox.showerror("Ошибка", msg, parent=sale_win)
+
+        btn_box = ttk.Frame(sale_win, padding=10)
+        btn_box.pack()
+        ttk.Button(
+            btn_box, text="Подтвердить продажу", command=confirm_sale
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_box, text="Отмена", command=sale_win.destroy).pack(
+            side=tk.LEFT, padx=5
+        )
+
+    # --- Массовая продажа (Корзина) с поиском ---
+    def open_bulk_sale_window(self):
+        if not self.current_shift:
+            messagebox.showwarning(
+                "Внимание",
+                "Нельзя списать товар при закрытой смене! Сначала откройте смену.",
+            )
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Массовая продажа товаров (Корзина)")
+        win.geometry("860x560")
+        win.grab_set()
+
+        cart = {}
+
+        panes = ttk.PanedWindow(win, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Слева каталог
+        left_frame = ttk.LabelFrame(panes, text="Каталог товаров", padding=5)
+        panes.add(left_frame, weight=1)
+
+        # Поиск в каталоге корзины
+        search_box = ttk.Frame(left_frame)
+        search_box.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(search_box, text="Поиск:").pack(side=tk.LEFT, padx=3)
+        cart_search_var = tk.StringVar()
+        cart_search_entry = ttk.Entry(search_box, textvariable=cart_search_var)
+        cart_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+
+        left_tree = ttk.Treeview(
+            left_frame,
+            columns=("id", "sku", "name", "price", "qty"),
+            show="headings",
+            height=13,
+        )
+        left_tree.heading("id", text="ID")
+        left_tree.heading("sku", text="Артикул")
+        left_tree.heading("name", text="Товар")
+        left_tree.heading("price", text="Цена")
+        left_tree.heading("qty", text="Остаток")
+
+        left_tree.column("id", width=30, anchor=tk.CENTER)
+        left_tree.column("sku", width=75, anchor=tk.CENTER)
+        left_tree.column("name", width=170)
+        left_tree.column("price", width=65, anchor=tk.E)
+        left_tree.column("qty", width=55, anchor=tk.CENTER)
+        left_tree.pack(fill=tk.BOTH, expand=True)
+
+        def refresh_left_catalog():
+            for row_id in left_tree.get_children():
+                left_tree.delete(row_id)
+            query = cart_search_var.get().strip()
+            for r in self.db.get_inventory(search_text=query):
+                left_tree.insert(
+                    "",
+                    tk.END,
+                    values=(r[0], r[1], r[2], f"{r[4]:.2f}", r[5]),
+                )
+
+        cart_search_entry.bind(
+            "<KeyRelease>", lambda e: refresh_left_catalog()
+        )
+        refresh_left_catalog()
+
+        # Справа корзина (чек)
+        right_frame = ttk.LabelFrame(panes, text="Корзина (чек)", padding=5)
+        panes.add(right_frame, weight=1)
+
+        cart_tree = ttk.Treeview(
+            right_frame,
+            columns=("id", "name", "qty", "price", "sum"),
+            show="headings",
+            height=15,
+        )
+        cart_tree.heading("id", text="ID")
+        cart_tree.heading("name", text="Товар")
+        cart_tree.heading("qty", text="Кол-во")
+        cart_tree.heading("price", text="Цена")
+        cart_tree.heading("sum", text="Сумма")
+
+        cart_tree.column("id", width=30, anchor=tk.CENTER)
+        cart_tree.column("name", width=150)
+        cart_tree.column("qty", width=55, anchor=tk.CENTER)
+        cart_tree.column("price", width=65, anchor=tk.E)
+        cart_tree.column("sum", width=75, anchor=tk.E)
+        cart_tree.pack(fill=tk.BOTH, expand=True)
+
+        lbl_cart_total = ttk.Label(
+            right_frame,
+            text="Итого: 0.00 руб.",
+            font=("Arial", 11, "bold"),
+            padding=5,
+        )
+        lbl_cart_total.pack()
+
+        def update_cart_display():
+            for item in cart_tree.get_children():
+                cart_tree.delete(item)
+            total = 0.0
+            for pid, data in cart.items():
+                s = data["qty"] * data["price"]
+                total += s
+                cart_tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        pid,
+                        data["name"],
+                        data["qty"],
+                        f"{data['price']:.2f}",
+                        f"{s:.2f}",
+                    ),
+                )
+            lbl_cart_total.config(text=f"Итого: {total:,.2f} руб.")
+
+        def add_to_cart():
+            sel = left_tree.selection()
+            if not sel:
+                return
+            item = left_tree.item(sel[0])["values"]
+            pid, name, price = (
+                item[0],
+                item[2],
+                float(item[3]),
+            )
+
+            if pid in cart:
+                cart[pid]["qty"] += 1
+            else:
+                cart[pid] = {
+                    "name": name,
+                    "price": price,
+                    "qty": 1,
+                }
+            update_cart_display()
+
+        def remove_from_cart():
+            sel = cart_tree.selection()
+            if not sel:
+                return
+            pid = cart_tree.item(sel[0])["values"][0]
+            if pid in cart:
+                if cart[pid]["qty"] > 1:
+                    cart[pid]["qty"] -= 1
+                else:
+                    del cart[pid]
+            update_cart_display()
+
+        ttk.Button(
+            left_frame, text="➕ Добавить в чек (+1)", command=add_to_cart
+        ).pack(pady=5)
+        ttk.Button(
+            right_frame, text="➖ Убавить из чека (-1)", command=remove_from_cart
+        ).pack(pady=5)
+
+        bottom_cart = ttk.Frame(win, padding=10)
+        bottom_cart.pack(fill=tk.X)
+
+        ttk.Label(bottom_cart, text="Способ оплаты чека:").pack(
+            side=tk.LEFT, padx=5
+        )
+        bulk_pay_type = tk.StringVar(value="cash")
+        ttk.Combobox(
+            bottom_cart,
+            textvariable=bulk_pay_type,
+            values=["cash", "card"],
+            state="readonly",
+            width=10,
+        ).pack(side=tk.LEFT, padx=5)
+
+        def complete_bulk_sale():
+            if not cart:
+                messagebox.showwarning(
+                    "Внимание", "Корзина пуста!", parent=win
+                )
+                return
+
+            pay_method = bulk_pay_type.get()
+            for pid, data in cart.items():
+                ok, msg = self.db.sell_item(
+                    self.current_shift[0],
+                    pid,
+                    data["qty"],
+                    payment_type=pay_method,
+                )
+                if not ok:
+                    messagebox.showerror(
+                        "Ошибка при оформлении",
+                        f"{data['name']}: {msg}",
+                        parent=win,
+                    )
+                    self.refresh_table()
+                    win.destroy()
+                    return
+
+            messagebox.showinfo("Успех", "Чек успешно проведён!", parent=win)
+            self.refresh_table()
+            win.destroy()
+
+        ttk.Button(
+            bottom_cart, text="✅ Пробить чек", command=complete_bulk_sale
+        ).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_cart, text="Отмена", command=win.destroy).pack(
+            side=tk.RIGHT, padx=5
+        )
+
+    # --- Окно Поставки товаров (увеличение остатка) ---
+    def open_supply_window(self):
+        """Окно оформления поставки по существующей номенклатуре с поиском"""
+        win = tk.Toplevel(self.root)
+        win.title("Оформление поставки товара на склад")
+        win.geometry("860x560")
+        win.grab_set()
+
+        supply_batch = {}  # {prod_id: {'name': str, 'qty': int}}
+
+        panes = ttk.PanedWindow(win, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Слева: Выбор существующего товара
+        left_frame = ttk.LabelFrame(
+            panes, text="Выбор товара из базы", padding=5
+        )
+        panes.add(left_frame, weight=1)
+
+        search_box = ttk.Frame(left_frame)
+        search_box.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(search_box, text="Поиск:").pack(side=tk.LEFT, padx=3)
+        sup_search_var = tk.StringVar()
+        sup_search_entry = ttk.Entry(search_box, textvariable=sup_search_var)
+        sup_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=3)
+
+        left_tree = ttk.Treeview(
+            left_frame,
+            columns=("id", "sku", "name", "qty"),
+            show="headings",
+            height=13,
+        )
+        left_tree.heading("id", text="ID")
+        left_tree.heading("sku", text="Артикул")
+        left_tree.heading("name", text="Наименование")
+        left_tree.heading("qty", text="Остаток")
+
+        left_tree.column("id", width=35, anchor=tk.CENTER)
+        left_tree.column("sku", width=85, anchor=tk.CENTER)
+        left_tree.column("name", width=200)
+        left_tree.column("qty", width=65, anchor=tk.CENTER)
+        left_tree.pack(fill=tk.BOTH, expand=True)
+
+        def refresh_sup_catalog():
+            for r_id in left_tree.get_children():
+                left_tree.delete(r_id)
+            q = sup_search_var.get().strip()
+            for r in self.db.get_inventory(search_text=q):
+                left_tree.insert(
+                    "", tk.END, values=(r[0], r[1], r[2], r[5])
+                )
+
+        sup_search_entry.bind("<KeyRelease>", lambda e: refresh_sup_catalog())
+        refresh_sup_catalog()
+
+        # Панель выбора количества поставки
+        add_ctrl = ttk.Frame(left_frame, padding=4)
+        add_ctrl.pack(fill=tk.X)
+        ttk.Label(add_ctrl, text="Кол-во прихода:").pack(side=tk.LEFT, padx=3)
+        sup_qty_spin = ttk.Spinbox(add_ctrl, from_=1, to=99999, width=8)
+        sup_qty_spin.set(1)
+        sup_qty_spin.pack(side=tk.LEFT, padx=3)
+
+        # Справа: Накладная поставки
+        right_frame = ttk.LabelFrame(
+            panes, text="Накладная принимаемой поставки", padding=5
+        )
+        panes.add(right_frame, weight=1)
+
+        sup_tree = ttk.Treeview(
+            right_frame,
+            columns=("id", "name", "add_qty"),
+            show="headings",
+            height=15,
+        )
+        sup_tree.heading("id", text="ID")
+        sup_tree.heading("name", text="Товар")
+        sup_tree.heading("add_qty", text="Приход (шт.)")
+
+        sup_tree.column("id", width=35, anchor=tk.CENTER)
+        sup_tree.column("name", width=240)
+        sup_tree.column("add_qty", width=90, anchor=tk.CENTER)
+        sup_tree.pack(fill=tk.BOTH, expand=True)
+
+        lbl_sup_total = ttk.Label(
+            right_frame,
+            text="Всего к оприходованию: 0 шт.",
+            font=("Arial", 11, "bold"),
+            padding=5,
+        )
+        lbl_sup_total.pack()
+
+        def update_sup_display():
+            for itm in sup_tree.get_children():
+                sup_tree.delete(itm)
+            tot_qty = 0
+            for p_id, dat in supply_batch.items():
+                tot_qty += dat["qty"]
+                sup_tree.insert(
+                    "", tk.END, values=(p_id, dat["name"], dat["qty"])
+                )
+            lbl_sup_total.config(
+                text=f"Всего к оприходованию: {tot_qty} шт. ({len(supply_batch)} поз.)"
+            )
+
+        def add_to_supply():
+            sel = left_tree.selection()
+            if not sel:
+                messagebox.showwarning(
+                    "Внимание", "Выберите товар из списка слева!", parent=win
+                )
+                return
+            try:
+                count_to_add = int(sup_qty_spin.get())
+                if count_to_add <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "Ошибка", "Введите положительное целое число!", parent=win
+                )
+                return
+
+            row_data = left_tree.item(sel[0])["values"]
+            p_id, p_name = row_data[0], row_data[2]
+
+            if p_id in supply_batch:
+                supply_batch[p_id]["qty"] += count_to_add
+            else:
+                supply_batch[p_id] = {"name": p_name, "qty": count_to_add}
+            update_sup_display()
+
+        def remove_from_supply():
+            sel = sup_tree.selection()
+            if not sel:
+                return
+            p_id = sup_tree.item(sel[0])["values"][0]
+            if p_id in supply_batch:
+                del supply_batch[p_id]
+            update_sup_display()
+
+        ttk.Button(
+            add_ctrl, text="➕ В накладную", command=add_to_supply
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            right_frame, text="➖ Убрать позицию", command=remove_from_supply
+        ).pack(pady=5)
+
+        # Нижняя панель подтверждения
+        bottom_box = ttk.Frame(win, padding=10)
+        bottom_box.pack(fill=tk.X)
+
+        def complete_supply():
+            if not supply_batch:
+                messagebox.showwarning(
+                    "Внимание", "Накладная поставки пуста!", parent=win
+                )
+                return
+
+            shift_id = self.current_shift[0] if self.current_shift else None
+            for p_id, dat in supply_batch.items():
+                self.db.adjust_product_qty(
+                    p_id, dat["qty"], shift_id=shift_id, is_supply=True
+                )
+
+            self.refresh_table()
+            messagebox.showinfo(
+                "Успех",
+                "Поставка успешно оприходована, остатки товаров увеличены!",
+                parent=win,
+            )
+            win.destroy()
+
+        ttk.Button(
+            bottom_box,
+            text="✅ Принять поставку на склад",
+            command=complete_supply,
+        ).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(bottom_box, text="Отмена", command=win.destroy).pack(
+            side=tk.RIGHT, padx=5
+        )
+
+    # --- Окно Нового товара ---
+    def open_add_product_window(self):
+        cats = self.db.get_categories()
+        if not cats:
+            messagebox.showwarning(
+                "Внимание",
+                "Сначала создайте хотя бы одну категорию через 'Справочники'!",
+            )
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Добавление новой номенклатуры (Новый товар)")
+        win.geometry("400x290")
+        win.grab_set()
+
+        next_sku = self.db.generate_next_sku()
+        form = ttk.Frame(win, padding=15)
+        form.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            form, text=f"Артикул (авто): {next_sku}", font=("Arial", 10, "bold")
+        ).grid(row=0, column=0, columnspan=2, sticky=tk.W, pady=5)
+
+        ttk.Label(form, text="Наименование:").grid(
+            row=1, column=0, sticky=tk.W, pady=5
+        )
+        name_entry = ttk.Entry(form, width=28)
+        name_entry.grid(row=1, column=1, pady=5)
+        name_entry.focus()
+
+        ttk.Label(form, text="Категория:").grid(
+            row=2, column=0, sticky=tk.W, pady=5
+        )
+        cat_combo = ttk.Combobox(form, values=cats, state="readonly", width=26)
+        cat_combo.set(cats[0])
+        cat_combo.grid(row=2, column=1, pady=5)
+
+        ttk.Label(form, text="Цена (руб.):").grid(
+            row=3, column=0, sticky=tk.W, pady=5
+        )
+        price_entry = ttk.Entry(form, width=28)
+        price_entry.grid(row=3, column=1, pady=5)
+
+        ttk.Label(form, text="Начальный остаток (шт.):").grid(
+            row=4, column=0, sticky=tk.W, pady=5
+        )
+        qty_entry = ttk.Entry(form, width=28)
+        qty_entry.insert(0, "0")
+        qty_entry.grid(row=4, column=1, pady=5)
+
+        def save_product():
+            name = name_entry.get().strip()
+            cat = cat_combo.get()
+            try:
+                price = float(price_entry.get())
+                qty = int(qty_entry.get())
+                if price <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Укажите корректную положительную цену и целое количество!",
+                    parent=win,
+                )
+                return
+
+            if not name:
+                messagebox.showerror(
+                    "Ошибка", "Наименование не может быть пустым!", parent=win
+                )
+                return
+
+            shift_id = self.current_shift[0] if self.current_shift else None
+            self.db.add_product(name, cat, price, qty, shift_id=shift_id)
+            self.refresh_table()
+            win.destroy()
+            messagebox.showinfo(
+                "Успех", f"Товар '{name}' успешно добавлен в базу!"
+            )
+
+        ttk.Button(form, text="Создать товар", command=save_product).grid(
+            row=5, column=0, columnspan=2, pady=15
+        )
+
+    def handle_delete_products(self):
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showwarning(
+                "Внимание", "Выберите хотя бы один товар для удаления!"
+            )
+            return
+
+        cnt = len(selected)
+        confirm = messagebox.askyesno(
+            "Подтверждение",
+            f"Вы точно хотите удалить выбранные позиции ({cnt} шт.)?\nЭто действие нельзя отменить!",
+            icon="warning",
+        )
+        if not confirm:
+            return
+
+        ids = [self.tree.item(item)["values"][0] for item in selected]
+        self.db.delete_products(ids)
+        self.refresh_table()
+        messagebox.showinfo("Успешно", "Выбранные товары удалены.")
+
+    def open_category_manager(self):
+        win = tk.Toplevel(self.root)
+        win.title("Управление категориями")
+        win.geometry("350x380")
+        win.grab_set()
+
+        cat_list = tk.Listbox(win, height=12)
+        cat_list.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        def reload_cats():
+            cat_list.delete(0, tk.END)
+            for c in self.db.get_categories():
+                cat_list.insert(tk.END, c)
+            self.update_category_filter_list()
+
+        reload_cats()
+
+        ctrl_frame = ttk.Frame(win, padding=5)
+        ctrl_frame.pack(fill=tk.X)
+
+        new_entry = ttk.Entry(ctrl_frame)
+        new_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        def add_c():
+            val = new_entry.get().strip()
+            if val:
+                ok, msg = self.db.add_category(val)
+                if ok:
+                    new_entry.delete(0, tk.END)
+                    reload_cats()
+                else:
+                    messagebox.showerror("Ошибка", msg, parent=win)
+
+        ttk.Button(ctrl_frame, text="Добавить", command=add_c).pack(
+            side=tk.RIGHT, padx=5
+        )
+
+        def del_c():
+            sel = cat_list.curselection()
+            if not sel:
+                return
+            c_name = cat_list.get(sel[0])
+            self.db.delete_category(c_name)
+            reload_cats()
+
+        ttk.Button(win, text="Удалить выбранную", command=del_c).pack(
+            fill=tk.X, padx=10, pady=5
+        )
+
+    def show_summary_window(self, shift_id, summary_rows, payment_totals):
+        win = tk.Toplevel(self.root)
+        win.title(f"Итоговый отчет за смену #{shift_id}")
+        win.geometry("1020x500")
+
+        cols = (
+            "sku",
+            "name",
+            "initial",
+            "supplied",
+            "total_initial",
+            "sold",
+            "defect",
+            "final",
+            "price",
+            "revenue",
+        )
+        tree = ttk.Treeview(win, columns=cols, show="headings")
+        tree.heading("sku", text="Артикул")
+        tree.heading("name", text="Наименование")
+        tree.heading("initial", text="Начало")
+        tree.heading("supplied", text="Приход")
+        tree.heading("total_initial", text="Всего")
+        tree.heading("sold", text="Продано")
+        tree.heading("defect", text="Брак")
+        tree.heading("final", text="Остаток")
+        tree.heading("price", text="Цена/шт")
+        tree.heading("revenue", text="Выручка (руб.)")
+
+        tree.column("sku", width=85, anchor=tk.CENTER)
+        tree.column("name", width=230)
+        tree.column("initial", width=55, anchor=tk.CENTER)
+        tree.column("supplied", width=55, anchor=tk.CENTER)
+        tree.column("total_initial", width=55, anchor=tk.CENTER)
+        tree.column("sold", width=55, anchor=tk.CENTER)
+        tree.column("defect", width=55, anchor=tk.CENTER)
+        tree.column("final", width=65, anchor=tk.CENTER)
+        tree.column("price", width=85, anchor=tk.E)
+        tree.column("revenue", width=95, anchor=tk.E)
+
+        total_sold = 0
+        total_rev = 0.0
+
+        for r in summary_rows:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    r[0],
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5],
+                    r[6],
+                    r[7],
+                    f"{r[9]:,.2f}",
+                    f"{r[8]:,.2f}",
+                ),
+            )
+            total_sold += r[5]
+            total_rev += r[8]
+
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        cash_rev = payment_totals.get("cash", 0.0)
+        card_rev = payment_totals.get("card", 0.0)
+        current_cashbox = self.db.get_cash_balance()
+
+        summary_frame = ttk.LabelFrame(
+            win, text="Финансовые и складские итоги смены", padding=10
+        )
+        summary_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        line1 = (
+            f"📦 Всего продано: {total_sold} шт.   |   "
+            f"💰 Общая выручка: {total_rev:,.2f} руб."
+        )
+        ttk.Label(
+            summary_frame, text=line1, font=("Arial", 10, "bold")
+        ).pack(anchor=tk.W, pady=2)
+
+        line2 = (
+            f"💵 Оплата наличными: {cash_rev:,.2f} руб.   |   "
+            f"💳 Оплата по карте: {card_rev:,.2f} руб.   |   "
+            f"🏦 Фактический остаток наличных в кассе: {current_cashbox:,.2f} руб."
+        )
+        ttk.Label(
+            summary_frame,
+            text=line2,
+            font=("Arial", 10, "bold"),
+            foreground="darkblue",
+        ).pack(anchor=tk.W, pady=2)
+
+
+if __name__ == "__main__":
+    app_root = tk.Tk()
+    app = AutoShopApp(app_root)
+    app_root.mainloop()
